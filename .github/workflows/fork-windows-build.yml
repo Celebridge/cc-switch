@@ -1,0 +1,71 @@
+name: Fork Windows Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**.md'
+
+concurrency:
+  group: fork-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows x64 (patched)
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.12.3
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.95'
+          components: rustfmt, clippy
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend tests
+        run: pnpm test:unit
+
+      - name: Backend tests (effort mapping)
+        working-directory: src-tauri
+        run: cargo test --lib providers::transform
+
+      - name: Build MSI
+        run: pnpm tauri build --bundles msi
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-patched-windows-x64
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+
+      - name: Upload portable exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-patched-portable
+          path: src-tauri/target/release/cc-switch.exe
+          if-no-files-found: error

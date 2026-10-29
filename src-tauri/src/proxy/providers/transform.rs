@@ -84,6 +84,16 @@ pub fn supports_reasoning_effort(model: &str) -> bool {
             .and_then(|minor| minor.parse::<u32>().ok())
             .is_some_and(|minor| minor >= 5)
         || normalized.starts_with("grok-build-")
+        || is_deepseek_model(&normalized)
+}
+
+/// LOCAL PATCH: DeepSeek models behind an OpenAI-compatible gateway accept the
+/// full effort enum (`none` … `max`); the upstream normalises them to its own
+/// three real tiers (`low` / `high` / `max`) with `medium`→`high`,
+/// `xhigh`→`high`. Verified against OpenCode Go: `none` returns 0 reasoning
+/// tokens, `max` yields the largest reasoning budget.
+pub fn is_deepseek_model(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("deepseek-")
 }
 
 /// Detect models whose OpenAI reasoning effort supports a distinct `max` tier.
@@ -137,12 +147,16 @@ fn resolve_requested_reasoning_effort(body: &Value, model: &str) -> Option<&'sta
         .pointer("/output_config/effort")
         .and_then(|v| v.as_str())
     {
+        let deepseek = is_deepseek_model(model);
         let mapped = match effort {
             "low" => Some("low"),
             "medium" => Some("medium"),
             "high" => Some("high"),
             "xhigh" => Some("xhigh"),
-            "max" if supports_max_reasoning_effort(model) => Some("max"),
+            "none" if deepseek => Some("none"),
+            // LOCAL PATCH: DeepSeek exposes a distinct `max` tier, so keep it
+            // instead of degrading to `xhigh`.
+            "max" if deepseek || supports_max_reasoning_effort(model) => Some("max"),
             "max" => Some("xhigh"),
             _ => None, // unknown value — do not inject
         };
@@ -150,11 +164,16 @@ fn resolve_requested_reasoning_effort(body: &Value, model: &str) -> Option<&'sta
             body.pointer("/thinking/type").and_then(|t| t.as_str()),
             None | Some("disabled")
         );
-        return if thinking_off {
-            mapped.map(|_| "low")
-        } else {
-            mapped
-        };
+        if thinking_off {
+            // LOCAL PATCH: DeepSeek honours `none` as "disable thinking"; the
+            // generic `low` floor would leave reasoning on.
+            return if deepseek {
+                Some("none")
+            } else {
+                mapped.map(|_| "low")
+            };
+        }
+        return mapped;
     }
 
     // --- Priority 2: thinking.type + budget_tokens fallback ---
@@ -2151,6 +2170,54 @@ mod tests {
     fn test_output_config_xhigh_maps_verbatim() {
         // Claude Code's `/effort xhigh` sends output_config.effort="xhigh"
         let body = json!({"thinking": {"type": "adaptive"}, "output_config": {"effort": "xhigh"}});
+        assert_eq!(resolve_reasoning_effort(&body), Some("xhigh"));
+    }
+
+    #[test]
+    fn test_deepseek_effort_passes_full_enum_and_keeps_max() {
+        // LOCAL PATCH: DeepSeek accepts none/low/medium/high/xhigh/max and has a
+        // real `max` tier, so nothing is collapsed to xhigh.
+        for (effort, expected) in [
+            ("low", "low"),
+            ("medium", "medium"),
+            ("high", "high"),
+            ("xhigh", "xhigh"),
+            ("max", "max"),
+        ] {
+            let body = json!({
+                "model": "deepseek-v4.1-flash",
+                "thinking": {"type": "adaptive"},
+                "output_config": {"effort": effort}
+            });
+            assert_eq!(resolve_reasoning_effort(&body), Some(expected), "{effort}");
+        }
+    }
+
+    #[test]
+    fn test_deepseek_thinking_off_maps_to_none() {
+        // Turning thinking off must actually stop reasoning, not floor at `low`.
+        for body in [
+            json!({
+                "model": "deepseek-v4.1-flash",
+                "thinking": {"type": "disabled"},
+                "output_config": {"effort": "max"}
+            }),
+            json!({
+                "model": "deepseek-v4-pro",
+                "output_config": {"effort": "high"}
+            }),
+        ] {
+            assert_eq!(resolve_reasoning_effort(&body), Some("none"));
+        }
+    }
+
+    #[test]
+    fn test_non_deepseek_models_unchanged_by_patch() {
+        let body = json!({
+            "model": "gpt-5.4",
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "max"}
+        });
         assert_eq!(resolve_reasoning_effort(&body), Some("xhigh"));
     }
 
